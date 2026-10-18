@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Lumix DMC-TZ100 Control</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #18181b; color: #f4f4f5; margin: 0; padding: 20px; }
+        .grid { display: grid; grid-template-columns: 520px 1fr; gap: 24px; max-width: 1400px; margin: auto; }
+        .card { background: #27272a; padding: 16px; border-radius: 10px; }
+        h2 { margin-top: 0; font-size: 18px; border-bottom: 1px solid #3f3f46; padding-bottom: 10px; }
+        .stream-box { width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; margin-bottom: 12px; }
+        .stream-box img { width: 100%; height: 100%; object-fit: contain; }
+        .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+        button, select { background: #3f3f46; color: #fff; border: none; padding: 10px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; }
+        button:hover { background: #52525b; }
+        .btn-blue { background: #2563eb; } .btn-blue:hover { background: #1d4ed8; }
+        .btn-red { background: #dc2626; } .btn-red:hover { background: #b91c1c; }
+        .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; max-height: 75vh; overflow-y: auto; padding-right: 4px; }
+        .media-item { background: #18181b; padding: 8px; border-radius: 6px; text-align: center; font-size: 13px; }
+        .media-item img { width: 100%; height: 100px; object-fit: cover; border-radius: 4px; background: #000; margin-bottom: 6px; }
+        .media-item a { display: inline-block; margin-top: 6px; padding: 4px 8px; background: #2563eb; color: #fff; text-decoration: none; border-radius: 4px; font-size: 12px; }
+        #status { font-size: 12px; color: #a1a1aa; font-family: monospace; }
+    </style>
+</head>
+<body>
+<div class="grid">
+    <div class="card">
+        <h2>Видоискатель и Управление</h2>
+        <div class="stream-box">
+            <img id="live" src="" alt="Нажмите «Подключить камеру»">
+        </div>
+        <div class="btns">
+            <button class="btn-blue" onclick="connectCam()">1. Подключить камеру</button>
+            <button onclick="cmd('recmode')">Режим съемки</button>
+        </div>
+        <div class="btns">
+            <button class="btn-blue" onclick="cmd('capture')">📸 Сделать фото</button>
+            <button class="btn-red" onclick="cmd('video_recstart')">🔴 Старт видео</button>
+            <button onclick="cmd('video_recstop')">⏹ Стоп видео</button>
+        </div>
+        <div class="btns">
+            <select onchange="if(this.value) setParam('iso', this.value)">
+                <option value="">ISO...</option>
+                <option value="auto">Auto</option>
+                <option value="125">125</option>
+                <option value="400">400</option>
+                <option value="1600">1600</option>
+            </select>
+            <select onchange="if(this.value) setParam('focal', this.value)">
+                <option value="">Диафрагма...</option>
+                <option value="717">f/2.8</option>
+                <option value="1024">f/4.0</option>
+                <option value="1280">f/5.6</option>
+            </select>
+        </div>
+        <div id="status">Готов к работе</div>
+    </div>
+
+    <div class="card">
+        <h2>Галерея (Фото, RAW, 4K Видео)</h2>
+        <div class="btns">
+            <button class="btn-blue" onclick="loadFiles()">🔄 Загрузить список с флешки</button>
+            <span id="file-count" style="align-self: center; font-size: 13px; color: #a1a1aa;"></span>
+        </div>
+        <div class="gallery" id="gallery"></div>
+    </div>
+</div>
+
+<script>
+    const statusEl = document.getElementById('status');
+
+    async function connectCam() {
+        statusEl.innerText = 'Подключение (подтвердите на экране камеры, если спросит)...';
+        const r = await fetch('/api/connect', {method: 'POST'});
+        const d = await r.json();
+        statusEl.innerText = 'Подключено';
+        document.getElementById('live').src = '/api/stream?t=' + Date.now();
+    }
+
+    async function cmd(c) {
+        statusEl.innerText = 'Команда: ' + c;
+        await fetch('/api/cmd/' + c, {method: 'POST'});
+        if (c === 'recmode') {
+            document.getElementById('live').src = '/api/stream?t=' + Date.now();
+        }
+    }
+
+    async function setParam(type, val) {
+        await fetch(`/api/setting?type=${type}&value=${val}`, {method: 'POST'});
+        statusEl.innerText = `Установлено: ${type} = ${val}`;
+    }
+
+    async function loadFiles() {
+        statusEl.innerText = 'Переход в Playmode и чтение DLNA...';
+        document.getElementById('live').src = ''; // Останавливаем стрим
+        const r = await fetch('/api/files');
+        const data = await r.json();
+        const gal = document.getElementById('gallery');
+        gal.innerHTML = '';
+
+        if (data.error) {
+            statusEl.innerText = 'Ошибка: ' + data.error;
+            return;
+        }
+
+        document.getElementById('file-count').innerText = `Найдено: ${data.total}`;
+        statusEl.innerText = 'Список файлов получен';
+
+        data.items.forEach(item => {
+            const ext = item.original.split('.').pop();
+            const el = document.createElement('div');
+            el.className = 'media-item';
+            el.innerHTML = `
+                <img src="${item.thumb}" loading="lazy" alt="${item.title}">
+                <div><b>${item.title}</b> (${ext})</div>
+                <a href="${item.original}" download="${item.title}.${ext}" target="_blank">⬇ Скачать оригинал</a>
+            `;
+            gal.appendChild(el);
+        });
+    }
+</script>
+</body>
+</html>

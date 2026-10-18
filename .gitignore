@@ -1,0 +1,17 @@
+# Окружение и кэш Python
+venv/
+__pycache__/
+*.py[cod]
+
+# Конфигурация и секреты
+.env
+
+# Скачанные с камеры медиафайлы
+downloads/*
+!downloads/.gitkeep
+
+# IDE и ОС
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
