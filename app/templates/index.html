@@ -107,13 +107,19 @@
         statusEl.innerText = 'Список файлов получен';
 
         data.items.forEach(item => {
-            const ext = item.original.split('.').pop();
             const el = document.createElement('div');
             el.className = 'media-item';
+
+            const linksHtml = item.files.map(f => 
+                `<a href="${f.url}" download="${item.title}.${f.ext}" target="_blank">⬇ ${f.ext}</a>`
+            ).join(' ');
+
             el.innerHTML = `
                 <img src="${item.thumb}" loading="lazy" alt="${item.title}">
-                <div><b>${item.title}</b> (${ext})</div>
-                <a href="${item.original}" download="${item.title}.${ext}" target="_blank">⬇ Скачать оригинал</a>
+                <div style="margin-bottom: 4px;"><b>${item.title}</b></div>
+                <div style="display: flex; gap: 4px; justify-content: center; flex-wrap: wrap;">
+                    ${linksHtml}
+                </div>
             `;
             gal.appendChild(el);
         });

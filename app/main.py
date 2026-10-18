@@ -89,11 +89,27 @@ async def video_stream():
 
 
 @app.get("/api/files")
-def list_files(start: int = 0, count: int = 100):
+def list_files():
     cam_cgi("mode=camcmd&value=playmode")
     time.sleep(0.6)
 
-    soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
+    headers = {
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPACTION": '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"'
+    }
+    ns = {
+        "didl": "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/",
+        "dc": "http://purl.org/dc/elements/1.1/"
+    }
+
+    items = []
+    start = 0
+    batch_size = 50
+    total = None
+
+    try:
+        while True:
+            soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
  <s:Body>
   <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
@@ -101,46 +117,66 @@ def list_files(start: int = 0, count: int = 100):
    <BrowseFlag>BrowseDirectChildren</BrowseFlag>
    <Filter>*</Filter>
    <StartingIndex>{start}</StartingIndex>
-   <RequestedCount>{count}</RequestedCount>
+   <RequestedCount>{batch_size}</RequestedCount>
    <SortCriteria></SortCriteria>
   </u:Browse>
  </s:Body>
 </s:Envelope>"""
 
-    headers = {
-        "Content-Type": 'text/xml; charset="utf-8"',
-        "SOAPACTION": '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"'
-    }
+            r = requests.post(
+                f"http://{CAM_IP}:60606/Server0/CDS_control",
+                data=soap_body,
+                headers=headers,
+                timeout=5
+            )
+            root = ET.fromstring(r.text)
+            didl_xml = root.find(".//Result").text
+            number_returned = int(root.find(".//NumberReturned").text or 0)
 
-    try:
-        r = requests.post(f"http://{CAM_IP}:60606/Server0/CDS_control", data=soap_body, headers=headers, timeout=5)
-        root = ET.fromstring(r.text)
-        didl_xml = root.find(".//Result").text
-        total = root.find(".//TotalMatches").text
-        didl_root = ET.fromstring(didl_xml)
+            if total is None:
+                total = int(root.find(".//TotalMatches").text or 0)
 
-        ns = {"didl": "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/", "dc": "http://purl.org/dc/elements/1.1/"}
-        items = []
+            if not didl_xml or number_returned == 0:
+                break
 
-        for item in didl_root.findall("didl:item", ns):
-            title = item.find("dc:title", ns).text
-            res_list = item.findall("didl:res", ns)
-            orig_url, thumb_url = None, None
+            didl_root = ET.fromstring(didl_xml)
 
-            for res in res_list:
-                url = res.text
-                proto = res.attrib.get("protocolInfo", "")
-                if "JPEG_TN" in proto or "JPEG_SM" in proto:
-                    thumb_url = url
-                elif orig_url is None:
-                    orig_url = url
+            for item in didl_root.findall("didl:item", ns):
+                title = item.find("dc:title", ns).text
+                res_list = item.findall("didl:res", ns)
 
-            items.append({
-                "title": title,
-                "original": orig_url or (res_list[0].text if res_list else ""),
-                "thumb": thumb_url or orig_url
-            })
+                thumb_url = None
+                originals = []
 
-        return {"total": int(total or 0), "items": items}
+                for res in res_list:
+                    url = res.text
+                    proto = res.attrib.get("protocolInfo", "")
+                    # Отделяем мелкие превью от оригинальных файлов
+                    if "JPEG_TN" in proto or "JPEG_SM" in proto or "CAM_TN" in proto or "CAM_LRGTN" in proto:
+                        if thumb_url is None:
+                            thumb_url = url
+                    else:
+                        ext = url.split(".")[-1].upper()
+                        originals.append({"url": url, "ext": ext})
+
+                # Если камера не пометила оригинал, берем первый ресурс
+                if not originals and res_list:
+                    first_url = res_list[0].text
+                    originals.append({"url": first_url, "ext": first_url.split(".")[-1].upper()})
+
+                items.append({
+                    "title": title,
+                    "thumb": thumb_url or originals[0]["url"],
+                    "files": originals
+                })
+
+            start += number_returned
+            if start >= total:
+                break
+
+        # Разворачиваем список: самые свежие кадры и видео будут первыми
+        items.reverse()
+        return {"total": total or len(items), "items": items}
+
     except Exception as e:
         return {"error": str(e), "items": []}
