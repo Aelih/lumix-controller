@@ -36,7 +36,9 @@ def index():
 def connect_camera():
     res_acc = cam_cgi(f"mode=accctrl&type=req_acc&value=0&value2={DEVICE_NAME}")
     res_rec = cam_cgi("mode=camcmd&value=recmode")
+    time.sleep(1.2)  # Ждем, пока выдвинется объектив и включится матрица
     res_str = cam_cgi(f"mode=startstream&value={UDP_PORT}")
+    print(f"[CONNECT] acc={res_acc.strip()} | rec={res_rec.strip()} | stream={res_str.strip()}")
     return {"acc": res_acc, "rec": res_rec, "stream": res_str}
 
 
@@ -44,6 +46,7 @@ def connect_camera():
 def send_command(command: str):
     if command == "recmode":
         res = cam_cgi("mode=camcmd&value=recmode")
+        time.sleep(1.2)
         cam_cgi(f"mode=startstream&value={UDP_PORT}")
         return {"result": res}
     return {"result": cam_cgi(f"mode=camcmd&value={command}")}
@@ -58,24 +61,38 @@ async def mjpeg_generator():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", UDP_PORT))
-    sock.setblocking(False)
+    sock.settimeout(0.2)  # Неблокирующий таймаут для надежной работы на Windows
 
     loop = asyncio.get_running_loop()
-    last_keepalive = time.time()
+    last_keepalive = 0
+    frames_received = 0
 
     try:
         while True:
-            if time.time() - last_keepalive > 8:
+            # Каждые 7 секунд (и сразу при старте) подтверждаем камере, что мы ждем стрим
+            if time.time() - last_keepalive > 7:
                 loop.run_in_executor(None, cam_cgi, "mode=getstate")
+                loop.run_in_executor(None, cam_cgi, f"mode=startstream&value={UDP_PORT}")
                 last_keepalive = time.time()
 
             try:
-                data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=0.5)
+                # Читаем UDP-пакет в отдельном потоке, чтобы не зависал ProactorEventLoop на Windows
+                data, _ = await loop.run_in_executor(None, sock.recvfrom, 65535)
                 soi = data.find(b"\xff\xd8")
-                if soi != -1:
-                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data[soi:] + b"\r\n"
-            except asyncio.TimeoutError:
-                continue
+                eoi = data.rfind(b"\xff\xd9")
+                if soi != -1 and eoi != -1:
+                    jpeg = data[soi:eoi + 2]
+                    frames_received += 1
+                    if frames_received == 1:
+                        print(f"[STREAM] Пошел видеопоток! Первый кадр: {len(jpeg)} байт")
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n" +
+                        jpeg + b"\r\n"
+                    )
+            except socket.timeout:
+                await asyncio.sleep(0.01)
     finally:
         sock.close()
 
