@@ -110,9 +110,10 @@
             const el = document.createElement('div');
             el.className = 'media-item';
 
-            const linksHtml = item.files.map(f => 
-                `<a href="${f.url}" download="${item.title}.${f.ext}" target="_blank">⬇ ${f.ext}</a>`
-            ).join(' ');
+            const linksHtml = item.files.map(f => {
+                const dlUrl = `/api/download?url=${encodeURIComponent(f.url)}&filename=${encodeURIComponent(item.title + '.' + f.ext)}`;
+                return `<a href="${dlUrl}">⬇ ${f.ext}</a>`;
+            }).join(' ');
 
             el.innerHTML = `
                 <img src="${item.thumb}" loading="lazy" alt="${item.title}">

@@ -8,6 +8,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, StreamingResponse
+import urllib.request
 
 load_dotenv()
 
@@ -219,3 +220,38 @@ def list_files():
 
     except Exception as e:
         return {"error": str(e), "items": []}
+
+@app.get("/api/download")
+def download_file(url: str = Query(...), filename: str = Query(...)):
+    """Скачивает сырой поток с камеры в обход бага кривого Transfer-Encoding: chunked."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "LumixController/1.0",
+        "Connection": "close"
+    })
+    # Открываем соединение (таймаут 30 секунд на случай больших 4K файлов)
+    resp = urllib.request.urlopen(req, timeout=30)
+
+    # ГЛАВНЫЙ ФИКС: запрещаем Python искать chunk-заголовки в сыром потоке камеры
+    resp.chunked = False
+
+    def file_stream():
+        try:
+            while True:
+                chunk = resp.read(262144)  # Читаем блоками по 256 КБ
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            resp.close()
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    }
+    if resp.headers.get("Content-Length"):
+        headers["Content-Length"] = resp.headers.get("Content-Length")
+
+    return StreamingResponse(
+        file_stream(),
+        media_type="application/octet-stream",
+        headers=headers
+    )
