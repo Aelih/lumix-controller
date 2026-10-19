@@ -19,9 +19,9 @@ BASE_DIR = Path(__file__).resolve().parent
 app = FastAPI(title="Lumix DMC-TZ100 API")
 
 
-def cam_cgi(params: str) -> str:
+def cam_cgi(params: str, timeout: int = 8) -> str:
     try:
-        r = requests.get(f"http://{CAM_IP}/cam.cgi?{params}", timeout=3)
+        r = requests.get(f"http://{CAM_IP}/cam.cgi?{params}", timeout=timeout)
         return r.text
     except Exception as e:
         return f"error: {e}"
@@ -34,10 +34,12 @@ def index():
 
 @app.post("/api/connect")
 def connect_camera():
-    res_acc = cam_cgi(f"mode=accctrl&type=req_acc&value=0&value2={DEVICE_NAME}")
-    res_rec = cam_cgi("mode=camcmd&value=recmode")
-    time.sleep(1.2)  # Ждем, пока выдвинется объектив и включится матрица
-    res_str = cam_cgi(f"mode=startstream&value={UDP_PORT}")
+    # Даем камере до 15 секунд на случай, если нужно подтвердить подключение на экране
+    res_acc = cam_cgi("mode=accctrl&type=req_acc&value=0&value2=MyPC", timeout=15)
+    time.sleep(0.5)
+    res_rec = cam_cgi("mode=camcmd&value=recmode", timeout=10)
+    time.sleep(1.5)  # Ждем механику объектива
+    res_str = cam_cgi(f"mode=startstream&value={UDP_PORT}", timeout=5)
     print(f"[CONNECT] acc={res_acc.strip()} | rec={res_rec.strip()} | stream={res_str.strip()}")
     return {"acc": res_acc, "rec": res_rec, "stream": res_str}
 
@@ -61,22 +63,20 @@ async def mjpeg_generator():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", UDP_PORT))
-    sock.settimeout(0.2)  # Неблокирующий таймаут для надежной работы на Windows
+    sock.settimeout(0.2)
 
     loop = asyncio.get_running_loop()
-    last_keepalive = 0
+    # Ставим текущий time.time(), чтобы НЕ бомбить камеру запросами в первую же секунду
+    last_keepalive = time.time()
     frames_received = 0
 
     try:
         while True:
-            # Каждые 7 секунд (и сразу при старте) подтверждаем камере, что мы ждем стрим
-            if time.time() - last_keepalive > 7:
+            if time.time() - last_keepalive > 8:
                 loop.run_in_executor(None, cam_cgi, "mode=getstate")
-                loop.run_in_executor(None, cam_cgi, f"mode=startstream&value={UDP_PORT}")
                 last_keepalive = time.time()
 
             try:
-                # Читаем UDP-пакет в отдельном потоке, чтобы не зависал ProactorEventLoop на Windows
                 data, _ = await loop.run_in_executor(None, sock.recvfrom, 65535)
                 soi = data.find(b"\xff\xd8")
                 eoi = data.rfind(b"\xff\xd9")
@@ -119,7 +119,8 @@ def list_files():
         "dc": "http://purl.org/dc/elements/1.1/"
     }
 
-    items = []
+    # Группируем по title (например, "118-0746"), чтобы объединить RAW+JPG в одну карточку
+    grouped = {}
     start = 0
     batch_size = 50
     total = None
@@ -162,38 +163,59 @@ def list_files():
                 title = item.find("dc:title", ns).text
                 res_list = item.findall("didl:res", ns)
 
-                thumb_url = None
-                originals = []
+                if title not in grouped:
+                    grouped[title] = {"title": title, "thumb": None, "files_map": {}}
+
+                entry = grouped[title]
 
                 for res in res_list:
                     url = res.text
+                    if not url:
+                        continue
+
+                    filename = url.split("/")[-1].upper()
+                    ext = filename.split(".")[-1]
                     proto = res.attrib.get("protocolInfo", "")
-                    # Отделяем мелкие превью от оригинальных файлов
-                    if "JPEG_TN" in proto or "JPEG_SM" in proto or "CAM_TN" in proto or "CAM_LRGTN" in proto:
-                        if thumb_url is None:
-                            thumb_url = url
+
+                    # У Panasonic превью начинаются с DT или DL, а оригиналы — с DO
+                    is_thumb = (
+                        filename.startswith("DT")
+                        or filename.startswith("DL")
+                        or "JPEG_TN" in proto
+                        or "JPEG_SM" in proto
+                        or "CAM_TN" in proto
+                        or "CAM_LRGTN" in proto
+                    )
+
+                    if is_thumb:
+                        # Для превью в галерее предпочитаем DT (быстрее грузится) или DL
+                        if entry["thumb"] is None or filename.startswith("DT"):
+                            entry["thumb"] = url
                     else:
-                        ext = url.split(".")[-1].upper()
-                        originals.append({"url": url, "ext": ext})
-
-                # Если камера не пометила оригинал, берем первый ресурс
-                if not originals and res_list:
-                    first_url = res_list[0].text
-                    originals.append({"url": first_url, "ext": first_url.split(".")[-1].upper()})
-
-                items.append({
-                    "title": title,
-                    "thumb": thumb_url or originals[0]["url"],
-                    "files": originals
-                })
+                        # Это оригинал (JPG, RW2 или MP4) — сохраняем ровно 1 экземпляр каждого формата
+                        if ext not in entry["files_map"]:
+                            entry["files_map"][ext] = {"url": url, "ext": ext}
 
             start += number_returned
             if start >= total:
                 break
 
-        # Разворачиваем список: самые свежие кадры и видео будут первыми
+        # Формируем итоговый список
+        items = []
+        for title, data in grouped.items():
+            files = list(data["files_map"].values())
+            if not files and data["thumb"]:
+                files = [{"url": data["thumb"], "ext": "JPG"}]
+
+            items.append({
+                "title": title,
+                "thumb": data["thumb"] or (files[0]["url"] if files else ""),
+                "files": files
+            })
+
+        # Свежие кадры — в начало списка
         items.reverse()
-        return {"total": total or len(items), "items": items}
+        return {"total": len(items), "items": items}
 
     except Exception as e:
         return {"error": str(e), "items": []}
