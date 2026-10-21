@@ -7,27 +7,31 @@
         body { font-family: system-ui, sans-serif; background: #18181b; color: #f4f4f5; margin: 0; padding: 20px; }
         .grid { display: grid; grid-template-columns: 520px 1fr; gap: 24px; max-width: 1400px; margin: auto; }
         .card { background: #27272a; padding: 16px; border-radius: 10px; }
-        h2 { margin-top: 0; font-size: 18px; border-bottom: 1px solid #3f3f46; padding-bottom: 10px; }
+        h2 { margin-top: 0; font-size: 18px; border-bottom: 1px solid #3f3f46; padding-bottom: 10px; display: flex; justify-content: space-between; }
         .stream-box { width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; margin-bottom: 12px; }
         .stream-box img { width: 100%; height: 100%; object-fit: contain; }
         .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
-        button, select { background: #3f3f46; color: #fff; border: none; padding: 10px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; }
-        button:hover { background: #52525b; }
+        button, select { background: #3f3f46; color: #fff; border: none; padding: 9px 13px; border-radius: 6px; cursor: pointer; font-weight: 500; }
+        button:hover, select:hover { background: #52525b; }
         .btn-blue { background: #2563eb; } .btn-blue:hover { background: #1d4ed8; }
         .btn-red { background: #dc2626; } .btn-red:hover { background: #b91c1c; }
-        .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; max-height: 75vh; overflow-y: auto; padding-right: 4px; }
+        .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; max-height: 75vh; overflow-y: auto; padding-right: 4px; }
         .media-item { background: #18181b; padding: 8px; border-radius: 6px; text-align: center; font-size: 13px; }
-        .media-item img { width: 100%; height: 100px; object-fit: cover; border-radius: 4px; background: #000; margin-bottom: 6px; }
-        .media-item a { display: inline-block; margin-top: 6px; padding: 4px 8px; background: #2563eb; color: #fff; text-decoration: none; border-radius: 4px; font-size: 12px; }
-        #status { font-size: 12px; color: #a1a1aa; font-family: monospace; }
+        .media-item img { width: 100%; height: 105px; object-fit: cover; border-radius: 4px; background: #000; margin-bottom: 6px; }
+        .media-item a { display: inline-block; padding: 5px 10px; background: #2563eb; color: #fff; text-decoration: none; border-radius: 4px; font-size: 12px; }
+        .media-item a:hover { background: #1d4ed8; }
+        #status { font-size: 12px; color: #a1a1aa; font-family: monospace; margin-top: 8px; }
     </style>
 </head>
 <body>
 <div class="grid">
     <div class="card">
-        <h2>Видоискатель и Управление</h2>
+        <h2>
+            <span>Видоискатель и Управление</span>
+            <span id="batt" style="font-size: 14px; color: #fbbf24;"></span>
+        </h2>
         <div class="stream-box">
-            <img id="live" src="" alt="Нажмите «Подключить камеру»">
+            <img id="live" alt="Нажмите «1. Подключить камеру»">
         </div>
         <div class="btns">
             <button class="btn-blue" onclick="connectCam()">1. Подключить камеру</button>
@@ -39,25 +43,15 @@
             <button onclick="cmd('video_recstop')">⏹ Стоп видео</button>
         </div>
         <div class="btns">
-            <select onchange="if(this.value) setParam('iso', this.value)">
-                <option value="">ISO...</option>
-                <option value="auto">Auto</option>
-                <option value="125">125</option>
-                <option value="400">400</option>
-                <option value="1600">1600</option>
-            </select>
-            <select onchange="if(this.value) setParam('focal', this.value)">
-                <option value="">Диафрагма...</option>
-                <option value="717">f/2.8</option>
-                <option value="1024">f/4.0</option>
-                <option value="1280">f/5.6</option>
-            </select>
+            <button onmousedown="cmd('wide-normal')" onmouseup="cmd('zoomstop')">🔍 Зум - (W)</button>
+            <button onmousedown="cmd('tele-normal')" onmouseup="cmd('zoomstop')">🔎 Зум + (T)</button>
         </div>
+        <div class="btns" id="dynamic-settings"></div>
         <div id="status">Готов к работе</div>
     </div>
 
     <div class="card">
-        <h2>Галерея (Фото, RAW, 4K Видео)</h2>
+        <h2>Галерея (последние 45 файлов)</h2>
         <div class="btns">
             <button class="btn-blue" onclick="loadFiles()">🔄 Загрузить список с флешки</button>
             <span id="file-count" style="align-self: center; font-size: 13px; color: #a1a1aa;"></span>
@@ -68,31 +62,56 @@
 
 <script>
     const statusEl = document.getElementById('status');
+    const liveImg = document.getElementById('live');
+
+    loadMenu();
 
     async function connectCam() {
-        statusEl.innerText = 'Подключение (подтвердите на экране камеры, если спросит)...';
+        statusEl.innerText = 'Подключение к камере...';
         const r = await fetch('/api/connect', {method: 'POST'});
         const d = await r.json();
+        if (d.batt) document.getElementById('batt').innerText = '🔋 ' + d.batt;
         statusEl.innerText = 'Подключено';
-        document.getElementById('live').src = '/api/stream?t=' + Date.now();
+        liveImg.src = '/api/stream?t=' + Date.now();
+    }
+
+    async function loadMenu() {
+        const r = await fetch('/api/menu');
+        const data = await r.json();
+        if (!data.groups) return;
+
+        const container = document.getElementById('dynamic-settings');
+        container.innerHTML = '';
+
+        data.groups.forEach(group => {
+            const sel = document.createElement('select');
+            sel.innerHTML = `<option value="">${group.title}</option>` +
+                group.options.map(o => `<option value="${o.value}">${o.label}</option>`).join('');
+            sel.onchange = () => { if (sel.value) setParam(group.type, sel.value); };
+            container.appendChild(sel);
+        });
     }
 
     async function cmd(c) {
         statusEl.innerText = 'Команда: ' + c;
         await fetch('/api/cmd/' + c, {method: 'POST'});
         if (c === 'recmode') {
-            document.getElementById('live').src = '/api/stream?t=' + Date.now();
+            liveImg.src = '/api/stream?t=' + Date.now();
         }
     }
 
-    async function setParam(type, val) {
-        await fetch(`/api/setting?type=${type}&value=${val}`, {method: 'POST'});
-        statusEl.innerText = `Установлено: ${type} = ${val}`;
+    async function setParam(type, rawVal) {
+        const [val, val2] = rawVal.split('|');
+        let url = `/api/setting?type=${encodeURIComponent(type)}&value=${encodeURIComponent(val)}`;
+        if (val2) url += `&value2=${encodeURIComponent(val2)}`;
+        await fetch(url, {method: 'POST'});
+        statusEl.innerText = `Установлено: ${type} = ${rawVal}`;
     }
 
     async function loadFiles() {
-        statusEl.innerText = 'Переход в Playmode и чтение DLNA...';
-        document.getElementById('live').src = ''; // Останавливаем стрим
+        statusEl.innerText = 'Чтение флешки...';
+        liveImg.removeAttribute('src');
+
         const r = await fetch('/api/files');
         const data = await r.json();
         const gal = document.getElementById('gallery');
@@ -103,27 +122,39 @@
             return;
         }
 
-        document.getElementById('file-count').innerText = `Найдено: ${data.total}`;
-        statusEl.innerText = 'Список файлов получен';
+        document.getElementById('file-count').innerText = `Всего: ${data.total} (показаны ${data.items.length})`;
+        statusEl.innerText = 'Загрузка миниатюр...';
+
+        const thumbQueue = [];
 
         data.items.forEach(item => {
             const el = document.createElement('div');
             el.className = 'media-item';
 
             const linksHtml = item.files.map(f => {
-                const dlUrl = `/api/download?url=${encodeURIComponent(f.url)}&filename=${encodeURIComponent(item.title + '.' + f.ext)}`;
-                return `<a href="${dlUrl}">⬇ ${f.ext}</a>`;
+                const label = f.label || f.ext;
+                const dlUrl = `/api/download?url=${encodeURIComponent(f.url)}&filename=${encodeURIComponent(item.title + '.' + f.ext)}&size=${f.size || 0}`;
+                return `<a href="${dlUrl}">⬇ ${label}</a>`;
             }).join(' ');
 
             el.innerHTML = `
-                <img src="${item.thumb}" loading="lazy" alt="${item.title}">
-                <div style="margin-bottom: 4px;"><b>${item.title}</b></div>
-                <div style="display: flex; gap: 4px; justify-content: center; flex-wrap: wrap;">
-                    ${linksHtml}
-                </div>
+                <img data-src="${item.thumb}" alt="${item.title}">
+                <div style="margin-bottom: 6px;"><b>${item.title}</b></div>
+                <div>${linksHtml}</div>
             `;
             gal.appendChild(el);
+            thumbQueue.push(el.querySelector('img'));
         });
+
+        // Грузим превью строго по очереди, чтобы однопоточный сервер камеры не сбрасывал соединения
+        for (const img of thumbQueue) {
+            await new Promise(resolve => {
+                img.onload = resolve;
+                img.onerror = resolve;
+                img.src = img.dataset.src;
+            });
+        }
+        statusEl.innerText = 'Готово';
     }
 </script>
 </body>

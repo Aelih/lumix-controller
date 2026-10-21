@@ -2,25 +2,27 @@ import asyncio
 import os
 import socket
 import time
+import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
-from fastapi.responses import FileResponse, StreamingResponse
-import urllib.request
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 load_dotenv()
 
 CAM_IP = os.getenv("CAM_IP", "192.168.54.1")
 UDP_PORT = int(os.getenv("UDP_PORT", 49152))
-DEVICE_NAME = os.getenv("DEVICE_NAME", "FastAPI_PC")
+DEVICE_NAME = os.getenv("DEVICE_NAME", "MyPC")
+LUMIX_UUID = "4D454930-0100-1000-8001-020B00000000"
 BASE_DIR = Path(__file__).resolve().parent
 
 app = FastAPI(title="Lumix DMC-TZ100 API")
 
 
-def cam_cgi(params: str, timeout: int = 8) -> str:
+def cam_cgi(params: str, timeout: int = 5) -> str:
     try:
         r = requests.get(f"http://{CAM_IP}/cam.cgi?{params}", timeout=timeout)
         return r.text
@@ -35,29 +37,76 @@ def index():
 
 @app.post("/api/connect")
 def connect_camera():
-    # Даем камере до 15 секунд на случай, если нужно подтвердить подключение на экране
-    res_acc = cam_cgi("mode=accctrl&type=req_acc&value=0&value2=MyPC", timeout=15)
-    time.sleep(0.5)
-    res_rec = cam_cgi("mode=camcmd&value=recmode", timeout=10)
-    time.sleep(1.5)  # Ждем механику объектива
-    res_str = cam_cgi(f"mode=startstream&value={UDP_PORT}", timeout=5)
-    print(f"[CONNECT] acc={res_acc.strip()} | rec={res_rec.strip()} | stream={res_str.strip()}")
-    return {"acc": res_acc, "rec": res_rec, "stream": res_str}
+    acc = cam_cgi(f"mode=accctrl&type=req_acc&value={LUMIX_UUID}&value2={DEVICE_NAME}", timeout=10)
+    rec = cam_cgi("mode=camcmd&value=recmode", timeout=10)
+    time.sleep(1.0)
+    stream = cam_cgi(f"mode=startstream&value={UDP_PORT}")
+    state_xml = cam_cgi("mode=getstate")
+    batt = ""
+    if "<batt>" in state_xml:
+        batt = ET.fromstring(state_xml).findtext(".//batt", "")
+    return {"acc": acc, "rec": rec, "stream": stream, "batt": batt}
 
 
 @app.post("/api/cmd/{command}")
 def send_command(command: str):
+    res = cam_cgi(f"mode=camcmd&value={command}")
     if command == "recmode":
-        res = cam_cgi("mode=camcmd&value=recmode")
-        time.sleep(1.2)
+        time.sleep(1.0)
         cam_cgi(f"mode=startstream&value={UDP_PORT}")
-        return {"result": res}
-    return {"result": cam_cgi(f"mode=camcmd&value={command}")}
+    return {"result": res}
 
 
 @app.post("/api/setting")
-def set_setting(type: str = Query(...), value: str = Query(...)):
-    return {"result": cam_cgi(f"mode=setsetting&type={type}&value={value}")}
+def set_setting(type: str = Query(...), value: str = Query(...), value2: str = Query(None)):
+    q = f"mode=setsetting&type={type}&value={value}" + (f"&value2={value2}" if value2 else "")
+    return {"result": cam_cgi(q)}
+
+
+@app.get("/api/menu")
+def get_dynamic_menu():
+    xml_path = BASE_DIR.parent / "tz100_allmenu.xml"
+    if not xml_path.exists():
+        return {"groups": []}
+
+    root = ET.fromstring(xml_path.read_text(encoding="utf-8"))
+    titles = {
+        t.attrib["id"]: t.text
+        for lang in ("en", "ru")
+        for t in root.findall(f".//titlelist/language[@code='{lang}']/title")
+        if t.attrib.get("id") and t.text
+    }
+
+    settings_map = {}
+    for item in root.findall(".//item[@cmd_mode='setsetting']"):
+        if item.find("group") is not None:
+            continue
+        ctype, cval, cval2 = item.get("cmd_type"), item.get("cmd_value"), item.get("cmd_value2")
+        if not ctype or not cval or "__value__" in (cval, cval2):
+            continue
+
+        full_val = f"{cval}|{cval2}" if cval2 else cval
+        label = titles.get(item.get("title_id", ""), cval2 or cval)
+        opts = settings_map.setdefault(ctype, [])
+        if not any(o["value"] == full_val for o in opts):
+            opts.append({"value": full_val, "label": label})
+
+    wanted = [
+        ("quality", "title_quality"),
+        ("iso", "title_sensitivity"),
+        ("exposure", "title_exposure2"),
+        ("whitebalance", "title_whitebalance"),
+        ("videoquality", "title_v_quality"),
+        ("drivemode", "title_drivemode"),
+        ("afmode", "title_afmode"),
+        ("focusmode", "title_focusmode"),
+    ]
+    return {
+        "groups": [
+            {"type": k, "title": titles.get(tid, k), "options": settings_map[k]}
+            for k, tid in wanted if k in settings_map
+        ]
+    }
 
 
 async def mjpeg_generator():
@@ -65,33 +114,22 @@ async def mjpeg_generator():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", UDP_PORT))
     sock.settimeout(0.2)
-
     loop = asyncio.get_running_loop()
-    # Ставим текущий time.time(), чтобы НЕ бомбить камеру запросами в первую же секунду
-    last_keepalive = time.time()
-    frames_received = 0
+    last_ka = time.time()
 
     try:
         while True:
-            if time.time() - last_keepalive > 8:
+            if time.time() - last_ka > 8:
                 loop.run_in_executor(None, cam_cgi, "mode=getstate")
-                last_keepalive = time.time()
-
+                last_ka = time.time()
             try:
+                # Работает на любой версии Python и Windows
                 data, _ = await loop.run_in_executor(None, sock.recvfrom, 65535)
                 soi = data.find(b"\xff\xd8")
                 eoi = data.rfind(b"\xff\xd9")
                 if soi != -1 and eoi != -1:
                     jpeg = data[soi:eoi + 2]
-                    frames_received += 1
-                    if frames_received == 1:
-                        print(f"[STREAM] Пошел видеопоток! Первый кадр: {len(jpeg)} байт")
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n" +
-                        jpeg + b"\r\n"
-                    )
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
             except socket.timeout:
                 await asyncio.sleep(0.01)
     finally:
@@ -100,35 +138,11 @@ async def mjpeg_generator():
 
 @app.get("/api/stream")
 async def video_stream():
-    return StreamingResponse(
-        mjpeg_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+    return StreamingResponse(mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
-@app.get("/api/files")
-def list_files():
-    cam_cgi("mode=camcmd&value=playmode")
-    time.sleep(0.6)
-
-    headers = {
-        "Content-Type": 'text/xml; charset="utf-8"',
-        "SOAPACTION": '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"'
-    }
-    ns = {
-        "didl": "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/",
-        "dc": "http://purl.org/dc/elements/1.1/"
-    }
-
-    # Группируем по title (например, "118-0746"), чтобы объединить RAW+JPG в одну карточку
-    grouped = {}
-    start = 0
-    batch_size = 50
-    total = None
-
-    try:
-        while True:
-            soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
+def browse_dlna(start: int, count: int):
+    soap = f"""<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
  <s:Body>
   <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
@@ -136,122 +150,135 @@ def list_files():
    <BrowseFlag>BrowseDirectChildren</BrowseFlag>
    <Filter>*</Filter>
    <StartingIndex>{start}</StartingIndex>
-   <RequestedCount>{batch_size}</RequestedCount>
+   <RequestedCount>{count}</RequestedCount>
    <SortCriteria></SortCriteria>
   </u:Browse>
  </s:Body>
 </s:Envelope>"""
+    headers = {
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPACTION": '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"'
+    }
+    r = requests.post(f"http://{CAM_IP}:60606/Server0/CDS_control", data=soap, headers=headers, timeout=6)
+    root = ET.fromstring(r.text)
+    total = int(root.findtext(".//TotalMatches") or 0)
+    num_ret = int(root.findtext(".//NumberReturned") or 0)
+    didl = root.findtext(".//Result")
+    return total, num_ret, (ET.fromstring(didl) if didl else None)
 
-            r = requests.post(
-                f"http://{CAM_IP}:60606/Server0/CDS_control",
-                data=soap_body,
-                headers=headers,
-                timeout=5
-            )
-            root = ET.fromstring(r.text)
-            didl_xml = root.find(".//Result").text
-            number_returned = int(root.find(".//NumberReturned").text or 0)
 
-            if total is None:
-                total = int(root.find(".//TotalMatches").text or 0)
+@app.get("/api/files")
+def list_files(limit: int = 45):
+    """Загружает последние N файлов с конца флешки (пачками по 15, так как камера режет ответ по 15 шт)."""
+    cam_cgi("mode=camcmd&value=playmode")
+    time.sleep(0.5)
 
-            if not didl_xml or number_returned == 0:
+    try:
+        total, _, _ = browse_dlna(0, 1)
+        if total == 0:
+            return {"total": 0, "items": []}
+
+        start_idx = max(0, total - limit)
+        ns = {"didl": "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/", "dc": "http://purl.org/dc/elements/1.1/"}
+        items = []
+
+        while start_idx < total:
+            _, num_ret, didl_root = browse_dlna(start_idx, 15)
+            if not didl_root or num_ret == 0:
                 break
 
-            didl_root = ET.fromstring(didl_xml)
-
             for item in didl_root.findall("didl:item", ns):
-                title = item.find("dc:title", ns).text
+                title = item.findtext("dc:title", "", ns)
                 res_list = item.findall("didl:res", ns)
 
-                if title not in grouped:
-                    grouped[title] = {"title": title, "thumb": None, "files_map": {}}
-
-                entry = grouped[title]
+                dt_url = None
+                ds_url = None
+                ds_size = 0
+                do_url = None
+                do_size = 0
+                do_ext = "JPG"
 
                 for res in res_list:
                     url = res.text
                     if not url:
                         continue
+                    size = int(res.get("size") or 0)
+                    fname = url.split("/")[-1].upper()
 
-                    filename = url.split("/")[-1].upper()
-                    ext = filename.split(".")[-1]
-                    proto = res.attrib.get("protocolInfo", "")
+                    if fname.startswith("DT"):
+                        dt_url = url
+                    elif fname.startswith("DS"):
+                        ds_url = url
+                        ds_size = size
+                    elif fname.startswith("DO"):
+                        do_url = url
+                        do_size = size
+                        do_ext = fname.split(".")[-1]
 
-                    # У Panasonic превью начинаются с DT или DL, а оригиналы — с DO
-                    is_thumb = (
-                        filename.startswith("DT")
-                        or filename.startswith("DL")
-                        or "JPEG_TN" in proto
-                        or "JPEG_SM" in proto
-                        or "CAM_TN" in proto
-                        or "CAM_LRGTN" in proto
-                    )
+                files = []
+                # Если DO имеет size > 0 (это MP4 или настоящий JPG), даем ссылку на него
+                if do_url and do_size > 0:
+                    mb = round(do_size / (1024 * 1024), 1)
+                    label = f"{do_ext} ({mb} МБ)" if mb >= 1 else do_ext
+                    files.append({"url": do_url, "ext": do_ext, "label": label, "size": do_size})
+                elif ds_url:
+                    # Если DO имеет size="0" — это чистый RAW (камера не отдает RW2 по Wi-Fi, но отдает DS...JPG)
+                    files.append({"url": ds_url, "ext": "JPG", "label": "JPG (из RAW)", "size": ds_size})
 
-                    if is_thumb:
-                        # Для превью в галерее предпочитаем DT (быстрее грузится) или DL
-                        if entry["thumb"] is None or filename.startswith("DT"):
-                            entry["thumb"] = url
-                    else:
-                        # Это оригинал (JPG, RW2 или MP4) — сохраняем ровно 1 экземпляр каждого формата
-                        if ext not in entry["files_map"]:
-                            entry["files_map"][ext] = {"url": url, "ext": ext}
+                items.append({
+                    "title": title,
+                    "thumb": dt_url or ds_url,
+                    "files": files
+                })
 
-            start += number_returned
-            if start >= total:
-                break
+            start_idx += num_ret
 
-        # Формируем итоговый список
-        items = []
-        for title, data in grouped.items():
-            files = list(data["files_map"].values())
-            if not files and data["thumb"]:
-                files = [{"url": data["thumb"], "ext": "JPG"}]
-
-            items.append({
-                "title": title,
-                "thumb": data["thumb"] or (files[0]["url"] if files else ""),
-                "files": files
-            })
-
-        # Свежие кадры — в начало списка
         items.reverse()
-        return {"total": len(items), "items": items}
-
+        return {"total": total, "items": items}
     except Exception as e:
         return {"error": str(e), "items": []}
 
-@app.get("/api/download")
-def download_file(url: str = Query(...), filename: str = Query(...)):
-    """Скачивает сырой поток с камеры в обход бага кривого Transfer-Encoding: chunked."""
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "LumixController/1.0",
-        "Connection": "close"
-    })
-    # Открываем соединение (таймаут 30 секунд на случай больших 4K файлов)
-    resp = urllib.request.urlopen(req, timeout=30)
 
-    # ГЛАВНЫЙ ФИКС: запрещаем Python искать chunk-заголовки в сыром потоке камеры
+@app.get("/api/download")
+def download_file(url: str = Query(...), filename: str = Query(...), size: int = Query(0)):
+    is_jpg = filename.upper().endswith((".JPG", ".JPEG"))
+
+    # Для небольших фото (< 15 МБ) вычитываем целиком и очищаем границы JPEG (FF D8 ... FF D9)
+    if is_jpg and size < 15_000_000:
+        req = urllib.request.Request(url, headers={"Connection": "close"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            resp.chunked = False
+            raw = resp.read()
+
+        # Очищаем от возможных chunk-заголовков в начале/конце, ищем чистый JPEG
+        soi = raw.find(b"\xff\xd8\xff")
+        eoi = raw.rfind(b"\xff\xd9")
+        if soi != -1 and eoi != -1:
+            raw = raw[soi:eoi + 2]
+
+        return Response(
+            content=raw,
+            media_type="image/jpeg",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(raw))
+            }
+        )
+
+    # Для больших файлов (MP4 видео) стримим напрямую
+    req = urllib.request.Request(url, headers={"Connection": "close"})
+    resp = urllib.request.urlopen(req, timeout=30)
     resp.chunked = False
 
-    def file_stream():
+    def stream():
         try:
-            while True:
-                chunk = resp.read(262144)  # Читаем блоками по 256 КБ
-                if not chunk:
-                    break
+            while chunk := resp.read(262144):
                 yield chunk
         finally:
             resp.close()
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    }
-    if resp.headers.get("Content-Length"):
-        headers["Content-Length"] = resp.headers.get("Content-Length")
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if size > 0:
+        headers["Content-Length"] = str(size)
 
-    return StreamingResponse(
-        file_stream(),
-        media_type="application/octet-stream",
-        headers=headers
-    )
+    return StreamingResponse(stream(), media_type="application/octet-stream", headers=headers)
