@@ -3,16 +3,15 @@ import os
 import socket
 import time
 import urllib.request
+import http.client
+from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
-from fastapi.responses import FileResponse, Response, StreamingResponse
-
-import http.client
-from urllib.parse import urlparse
+from fastapi.responses import FileResponse, StreamingResponse
 
 load_dotenv()
 
@@ -126,7 +125,6 @@ async def mjpeg_generator():
                 loop.run_in_executor(None, cam_cgi, "mode=getstate")
                 last_ka = time.time()
             try:
-                # Работает на любой версии Python и Windows
                 data, _ = await loop.run_in_executor(None, sock.recvfrom, 65535)
                 soi = data.find(b"\xff\xd8")
                 eoi = data.rfind(b"\xff\xd9")
@@ -172,7 +170,6 @@ def browse_dlna(start: int, count: int):
 
 @app.get("/api/files")
 def list_files(offset: int = 0, limit: int = 45):
-    """Загружает пачку файлов с конца флешки со смещением offset."""
     if offset == 0:
         cam_cgi("mode=camcmd&value=playmode")
         time.sleep(0.5)
@@ -182,7 +179,6 @@ def list_files(offset: int = 0, limit: int = 45):
         if total == 0 or offset >= total:
             return {"total": total, "items": [], "has_more": False}
 
-        # Считаем диапазон с конца флешки
         end_idx = total - offset
         start_idx = max(0, end_idx - limit)
         ns = {"didl": "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/", "dc": "http://purl.org/dc/elements/1.1/"}
@@ -211,6 +207,7 @@ def list_files(offset: int = 0, limit: int = 45):
                     if not url:
                         continue
                     size = int(res.get("size") or 0)
+                    proto = res.get("protocolInfo") or ""
                     fname = url.split("/")[-1].upper()
 
                     if fname.startswith("DT"):
@@ -221,15 +218,20 @@ def list_files(offset: int = 0, limit: int = 45):
                     elif fname.startswith("DO"):
                         do_url = url
                         do_size = size
-                        do_ext = fname.split(".")[-1]
+                        # Если это RAW (метка UNKNOWN_DATA или CAM_RAW), принудительно меняем расширение на RW2
+                        if "UNKNOWN_DATA" in proto or "CAM_RAW" in proto or size == 0:
+                            do_ext = "RW2"
+                            # Исправляем URL с .JPG на .RW2, чтобы камера отдала оригинал
+                            if do_url.upper().endswith(".JPG"):
+                                do_url = do_url[:-4] + ".RW2"
+                        else:
+                            do_ext = fname.split(".")[-1]
 
                 files = []
-                if do_url and do_size > 0:
-                    mb = round(do_size / (1024 * 1024), 1)
+                if do_url:
+                    mb = round(do_size / (1024 * 1024), 1) if do_size > 0 else 22.2  # Примерный размер RAW если size=0
                     label = f"{do_ext} ({mb} МБ)" if mb >= 1 else do_ext
                     files.append({"url": do_url, "ext": do_ext, "label": label, "size": do_size})
-                elif ds_url:
-                    files.append({"url": ds_url, "ext": "JPG", "label": "JPG (из RAW)", "size": ds_size})
 
                 items.append({
                     "title": title,
@@ -240,11 +242,7 @@ def list_files(offset: int = 0, limit: int = 45):
             curr += num_ret
 
         items.reverse()
-        return {
-            "total": total,
-            "items": items,
-            "has_more": start_idx > 0
-        }
+        return {"total": total, "items": items, "has_more": start_idx > 0}
     except Exception as e:
         return {"error": str(e), "items": [], "has_more": False}
 
@@ -252,7 +250,7 @@ def list_files(offset: int = 0, limit: int = 45):
 @app.get("/api/download")
 def download_file(url: str = Query(...), filename: str = Query(...), size: int = Query(0)):
     parsed = urlparse(url)
-    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 50001, timeout=15)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 50001, timeout=30)
     conn.request("GET", parsed.path, headers={
         "User-Agent": "Panasonic Android/1.0 UPnP/1.0 DLNA/1.5",
         "Connection": "close"
@@ -263,8 +261,6 @@ def download_file(url: str = Query(...), filename: str = Query(...), size: int =
     def clean_stream():
         try:
             if is_chunked:
-                # Читаем HTTP-чанки вручную, удаляя текстовые заголовки размеров (убирает артефакты!),
-                # и не зависаем в конце, если камера не прислала закрывающий чанк.
                 while True:
                     line = resp.fp.readline()
                     if not line:
@@ -279,17 +275,15 @@ def download_file(url: str = Query(...), filename: str = Query(...), size: int =
                     if chunk_len == 0:
                         break
                     data = resp.fp.read(chunk_len)
-                    resp.fp.read(2)  # Считываем служебный \r\n после чанка
+                    resp.fp.read(2)
                     if data:
                         yield data
-                    # Если это конец JPEG (FF D9) на последнем неполном чанке — сразу выходим без ожидания таймаута
-                    if len(data) < chunk_len or (filename.upper().endswith(".JPG") and data.endswith(b"\xff\xd9")):
+                    if len(data) < chunk_len:
                         break
             else:
                 while chunk := resp.fp.read(262144):
                     yield chunk
         except (TimeoutError, socket.timeout):
-            # Если камера замолчала после отдачи последнего байта — просто завершаем поток
             pass
         finally:
             conn.close()
