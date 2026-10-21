@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
+import http.client
+from urllib.parse import urlparse
+
 load_dotenv()
 
 CAM_IP = os.getenv("CAM_IP", "192.168.54.1")
@@ -248,44 +251,51 @@ def list_files(offset: int = 0, limit: int = 45):
 
 @app.get("/api/download")
 def download_file(url: str = Query(...), filename: str = Query(...), size: int = Query(0)):
-    is_jpg = filename.upper().endswith((".JPG", ".JPEG"))
+    parsed = urlparse(url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 50001, timeout=15)
+    conn.request("GET", parsed.path, headers={
+        "User-Agent": "Panasonic Android/1.0 UPnP/1.0 DLNA/1.5",
+        "Connection": "close"
+    })
+    resp = conn.getresponse()
+    is_chunked = resp.getheader("Transfer-Encoding", "").lower() == "chunked"
 
-    # Для небольших фото (< 15 МБ) вычитываем целиком и очищаем границы JPEG (FF D8 ... FF D9)
-    if is_jpg and size < 15_000_000:
-        req = urllib.request.Request(url, headers={"Connection": "close"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            resp.chunked = False
-            raw = resp.read()
-
-        # Очищаем от возможных chunk-заголовков в начале/конце, ищем чистый JPEG
-        soi = raw.find(b"\xff\xd8\xff")
-        eoi = raw.rfind(b"\xff\xd9")
-        if soi != -1 and eoi != -1:
-            raw = raw[soi:eoi + 2]
-
-        return Response(
-            content=raw,
-            media_type="image/jpeg",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(len(raw))
-            }
-        )
-
-    # Для больших файлов (MP4 видео) стримим напрямую
-    req = urllib.request.Request(url, headers={"Connection": "close"})
-    resp = urllib.request.urlopen(req, timeout=30)
-    resp.chunked = False
-
-    def stream():
+    def clean_stream():
         try:
-            while chunk := resp.read(262144):
-                yield chunk
+            if is_chunked:
+                # Читаем HTTP-чанки вручную, удаляя текстовые заголовки размеров (убирает артефакты!),
+                # и не зависаем в конце, если камера не прислала закрывающий чанк.
+                while True:
+                    line = resp.fp.readline()
+                    if not line:
+                        break
+                    line_str = line.strip().split(b";")[0]
+                    if not line_str:
+                        continue
+                    try:
+                        chunk_len = int(line_str, 16)
+                    except ValueError:
+                        break
+                    if chunk_len == 0:
+                        break
+                    data = resp.fp.read(chunk_len)
+                    resp.fp.read(2)  # Считываем служебный \r\n после чанка
+                    if data:
+                        yield data
+                    # Если это конец JPEG (FF D9) на последнем неполном чанке — сразу выходим без ожидания таймаута
+                    if len(data) < chunk_len or (filename.upper().endswith(".JPG") and data.endswith(b"\xff\xd9")):
+                        break
+            else:
+                while chunk := resp.fp.read(262144):
+                    yield chunk
+        except (TimeoutError, socket.timeout):
+            # Если камера замолчала после отдачи последнего байта — просто завершаем поток
+            pass
         finally:
-            resp.close()
+            conn.close()
 
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    if size > 0:
+    if size > 0 and not is_chunked:
         headers["Content-Length"] = str(size)
 
-    return StreamingResponse(stream(), media_type="application/octet-stream", headers=headers)
+    return StreamingResponse(clean_stream(), media_type="application/octet-stream", headers=headers)
