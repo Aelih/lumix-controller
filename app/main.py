@@ -168,22 +168,27 @@ def browse_dlna(start: int, count: int):
 
 
 @app.get("/api/files")
-def list_files(limit: int = 45):
-    """Загружает последние N файлов с конца флешки (пачками по 15, так как камера режет ответ по 15 шт)."""
-    cam_cgi("mode=camcmd&value=playmode")
-    time.sleep(0.5)
+def list_files(offset: int = 0, limit: int = 45):
+    """Загружает пачку файлов с конца флешки со смещением offset."""
+    if offset == 0:
+        cam_cgi("mode=camcmd&value=playmode")
+        time.sleep(0.5)
 
     try:
         total, _, _ = browse_dlna(0, 1)
-        if total == 0:
-            return {"total": 0, "items": []}
+        if total == 0 or offset >= total:
+            return {"total": total, "items": [], "has_more": False}
 
-        start_idx = max(0, total - limit)
+        # Считаем диапазон с конца флешки
+        end_idx = total - offset
+        start_idx = max(0, end_idx - limit)
         ns = {"didl": "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/", "dc": "http://purl.org/dc/elements/1.1/"}
         items = []
 
-        while start_idx < total:
-            _, num_ret, didl_root = browse_dlna(start_idx, 15)
+        curr = start_idx
+        while curr < end_idx:
+            req_count = min(15, end_idx - curr)
+            _, num_ret, didl_root = browse_dlna(curr, req_count)
             if not didl_root or num_ret == 0:
                 break
 
@@ -216,13 +221,11 @@ def list_files(limit: int = 45):
                         do_ext = fname.split(".")[-1]
 
                 files = []
-                # Если DO имеет size > 0 (это MP4 или настоящий JPG), даем ссылку на него
                 if do_url and do_size > 0:
                     mb = round(do_size / (1024 * 1024), 1)
                     label = f"{do_ext} ({mb} МБ)" if mb >= 1 else do_ext
                     files.append({"url": do_url, "ext": do_ext, "label": label, "size": do_size})
                 elif ds_url:
-                    # Если DO имеет size="0" — это чистый RAW (камера не отдает RW2 по Wi-Fi, но отдает DS...JPG)
                     files.append({"url": ds_url, "ext": "JPG", "label": "JPG (из RAW)", "size": ds_size})
 
                 items.append({
@@ -231,12 +234,16 @@ def list_files(limit: int = 45):
                     "files": files
                 })
 
-            start_idx += num_ret
+            curr += num_ret
 
         items.reverse()
-        return {"total": total, "items": items}
+        return {
+            "total": total,
+            "items": items,
+            "has_more": start_idx > 0
+        }
     except Exception as e:
-        return {"error": str(e), "items": []}
+        return {"error": str(e), "items": [], "has_more": False}
 
 
 @app.get("/api/download")
