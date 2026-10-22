@@ -7,20 +7,23 @@
         body { font-family: system-ui, sans-serif; background: #18181b; color: #f4f4f5; margin: 0; padding: 20px; }
         .grid { display: grid; grid-template-columns: 520px 1fr; gap: 24px; max-width: 1400px; margin: auto; }
         .card { background: #27272a; padding: 16px; border-radius: 10px; }
-        h2 { margin-top: 0; font-size: 18px; border-bottom: 1px solid #3f3f46; padding-bottom: 10px; display: flex; justify-content: space-between; }
+        h2 { margin-top: 0; font-size: 18px; border-bottom: 1px solid #3f3f46; padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
         .stream-box { position: relative; width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; margin-bottom: 12px; }
         .stream-box img { width: 100%; height: 100%; object-fit: contain; }
         .fullscreen-btn { position: absolute; bottom: 8px; right: 8px; background: rgba(0, 0, 0, 0.6); color: #fff; border: none; border-radius: 4px; padding: 6px 10px; cursor: pointer; font-size: 16px; transition: background 0.2s; }
         .fullscreen-btn:hover { background: rgba(0, 0, 0, 0.8); }
-        .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+        .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; align-items: center; }
         button, select { background: #3f3f46; color: #fff; border: none; padding: 9px 13px; border-radius: 6px; cursor: pointer; font-weight: 500; }
         button:hover, select:hover { background: #52525b; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-blue { background: #2563eb; } .btn-blue:hover { background: #1d4ed8; }
         .btn-red { background: #dc2626; } .btn-red:hover { background: #b91c1c; }
+        .btn-green { background: #16a34a; } .btn-green:hover { background: #15803d; }
         .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; max-height: 70vh; overflow-y: auto; padding-right: 4px; }
-        .media-item { background: #18181b; padding: 8px; border-radius: 6px; text-align: center; font-size: 13px; }
-        .media-item img { width: 100%; height: 105px; object-fit: cover; border-radius: 4px; background: #000; margin-bottom: 6px; }
+        .media-item { position: relative; background: #18181b; padding: 8px; border-radius: 6px; text-align: center; font-size: 13px; border: 2px solid transparent; transition: border-color 0.2s; }
+        .media-item.selected { border-color: #2563eb; }
+        .media-item input[type="checkbox"] { position: absolute; top: 12px; left: 12px; width: 18px; height: 18px; cursor: pointer; z-index: 2; }
+        .media-item img { width: 100%; height: 105px; object-fit: cover; border-radius: 4px; background: #000; margin-bottom: 6px; cursor: pointer; }
         .media-item a { display: inline-block; padding: 5px 10px; background: #2563eb; color: #fff; text-decoration: none; border-radius: 4px; font-size: 12px; }
         .media-item a:hover { background: #1d4ed8; }
         #status { font-size: 12px; color: #a1a1aa; font-family: monospace; margin-top: 8px; }
@@ -55,9 +58,16 @@
     </div>
 
     <div class="card">
-        <h2>Галерея</h2>
+        <h2>
+            <span>Галерея</span>
+            <div style="display: flex; gap: 6px;">
+                <button style="font-size: 12px; padding: 5px 8px;" onclick="toggleSelectAll(true)">Выбрать все</button>
+                <button style="font-size: 12px; padding: 5px 8px;" onclick="toggleSelectAll(false)">Снять выбор</button>
+            </div>
+        </h2>
         <div class="btns">
             <button class="btn-blue" onclick="loadFiles(true)">🔄 Загрузить список с флешки</button>
+            <button class="btn-green" id="download-selected-btn" onclick="downloadSelected()" style="display: none;">📥 Скачать выбранные (<span id="selected-count">0</span>)</button>
             <span id="file-count" style="align-self: center; font-size: 13px; color: #a1a1aa;"></span>
         </div>
         <div class="gallery" id="gallery"></div>
@@ -117,6 +127,16 @@
         statusEl.innerText = `Установлено: ${type} = ${rawVal}`;
     }
 
+    function toggleFullscreen() {
+        const container = document.getElementById('stream-container');
+        if (!document.fullscreenElement) {
+            if (container.requestFullscreen) container.requestFullscreen();
+            else if (container.webkitRequestFullscreen) container.webkitRequestFullscreen();
+        } else {
+            if (document.exitFullscreen) document.exitFullscreen();
+        }
+    }
+
     async function loadFiles(reset = true) {
         const gal = document.getElementById('gallery');
         const moreBtn = document.getElementById('load-more-btn');
@@ -148,20 +168,37 @@
         const thumbQueue = [];
 
         data.items.forEach(item => {
+            // Берем по умолчанию первый файл из доступных (например, RW2 или JPG/MP4)
+            const mainFile = item.files[0];
+            if (!mainFile) return;
+
             const el = document.createElement('div');
             el.className = 'media-item';
+            el.dataset.url = mainFile.url;
+            el.dataset.filename = `${item.title}.${mainFile.ext}`;
+            el.dataset.size = mainFile.size || 0;
 
             const linksHtml = item.files.map(f => {
                 const label = f.label || f.ext;
                 const dlUrl = `/api/download?url=${encodeURIComponent(f.url)}&filename=${encodeURIComponent(item.title + '.' + f.ext)}&size=${f.size || 0}`;
-                return `<a href="${dlUrl}">⬇ ${label}</a>`;
+                return `<a href="${dlUrl}" onclick="event.stopPropagation()">⬇ ${label}</a>`;
             }).join(' ');
 
             el.innerHTML = `
+                <input type="checkbox" onchange="updateSelectedCount()">
                 <img data-src="${item.thumb}" alt="${item.title}">
                 <div style="margin-bottom: 6px;"><b>${item.title}</b></div>
                 <div>${linksHtml}</div>
             `;
+
+            // Клик по карточке или картинке переключает чекбокс
+            el.onclick = (e) => {
+                if (e.target.tagName === 'A') return;
+                const chk = el.querySelector('input[type="checkbox"]');
+                chk.checked = !chk.checked;
+                chk.dispatchEvent(new Event('change'));
+            };
+
             gal.appendChild(el);
             thumbQueue.push(el.querySelector('img'));
         });
@@ -174,27 +211,57 @@
             });
         }
         statusEl.innerText = 'Готово';
+        updateSelectedCount();
     }
 
-    function toggleFullscreen() {
-        const container = document.getElementById('stream-container');
-        if (!document.fullscreenElement) {
-            if (container.requestFullscreen) {
-                container.requestFullscreen();
-            } else if (container.webkitRequestFullscreen) { /* Safari */
-                container.webkitRequestFullscreen();
-            } else if (container.msRequestFullscreen) { /* IE11 */
-                container.msRequestFullscreen();
-            }
-        } else {
-            if (document.exitFullscreen) {
-                document.exitFullscreen();
-            } else if (document.webkitExitFullscreen) {
-                document.webkitExitFullscreen();
-            } else if (document.msExitFullscreen) {
-                document.msExitFullscreen();
-            }
+    function updateSelectedCount() {
+        const selected = document.querySelectorAll('.media-item input[type="checkbox"]:checked');
+        const btn = document.getElementById('download-selected-btn');
+        document.getElementById('selected-count').innerText = selected.length;
+        
+        document.querySelectorAll('.media-item').forEach(item => {
+            const chk = item.querySelector('input[type="checkbox"]');
+            if (chk.checked) item.classList.add('selected');
+            else item.classList.remove('selected');
+        });
+
+        btn.style.display = selected.length > 0 ? 'inline-block' : 'none';
+    }
+
+    function toggleSelectAll(select) {
+        document.querySelectorAll('.media-item input[type="checkbox"]').forEach(chk => {
+            chk.checked = select;
+        });
+        updateSelectedCount();
+    }
+
+    async function downloadSelected() {
+        const selectedItems = document.querySelectorAll('.media-item input[type="checkbox"]:checked');
+        if (selectedItems.length === 0) return;
+
+        statusEl.innerText = `Скачивание ${selectedItems.length} файлов...`;
+
+        for (let i = 0; i < selectedItems.length; i++) {
+            const item = selectedItems[i].closest('.media-item');
+            const url = item.dataset.url;
+            const filename = item.dataset.filename;
+            const size = item.dataset.size;
+
+            const dlUrl = `/api/download?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(filename)}&size=${size}`;
+            
+            // Создаем скрытую ссылку и эмулируем клик для старта скачивания
+            const a = document.createElement('a');
+            a.href = dlUrl;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+
+            // Небольшая пауза между стартами загрузок, чтобы браузер не захлебнулся
+            await new Promise(r => setTimeout(r, 400));
         }
+
+        statusEl.innerText = 'Массовое скачивание запущено';
     }
 </script>
 </body>
